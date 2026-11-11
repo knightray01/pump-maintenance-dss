@@ -1,0 +1,9 @@
+streamlit>=1.40,<2.0
+pandas>=2.1,<4.0
+numpy>=1.26,<3.0
+scikit-learn>=1.4,<2.0
+xgboost>=2.0,<4.0
+folium>=0.16,<1.0
+streamlit-folium>=0.20,<1.0
+requests>=2.31,<3.0
+plotly>=5.20,<7.0

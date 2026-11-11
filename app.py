@@ -968,12 +968,17 @@ elif selected_page == "Maintenance Worklist":
         )
         age_contrib = AHP_WEIGHTS["age"] * age_norm
         rank = int(priority.reset_index(drop=True).index[priority["id"] == selected_id][0]) + 1
-        age_years = int(2013 - row["construction_year"])  # Pump It Up data collected ~2013
+        # Age at the time of the 2013 survey, NOT current age -- this dataset is a frozen
+        # historical snapshot, so "how old was this pump when surveyed" is the only honest
+        # age claim we can make without assuming the pump still exists unchanged today.
+        age_years_at_survey = int(2013 - row["construction_year"])
 
         st.markdown(f"**Pump {selected_id} — {RISK_EMOJI[row['risk_level']]} {row['risk_level']} urgency**")
 
         st.markdown(
-            f"> This pump was built around **{int(row['construction_year'])}** (about **{age_years} years old**) "
+            f"> This pump was built around **{int(row['construction_year'])}** (about "
+            f"**{age_years_at_survey} years old as of the 2013 survey** -- this dataset doesn't "
+            "track age beyond that point) "
             f"and serves an estimated **{int(row['population']):,} people**. The model estimates a "
             f"**{row['needs_repair_confidence']:.0%}** chance it needs repair. Combining these factors, "
             f"it ranks **#{rank}** on the current priority list."
@@ -1069,6 +1074,12 @@ elif selected_page == "Cost & Capacity Scenario":
         st.metric("Pumps repaired within capacity", len(reached))
         st.metric("Flagged pumps NOT reached in time", len(unreached))
         st.metric("Estimated total cost", f"${triage_total:,.0f}")
+        st.caption(
+            f"Includes ${triage_cost:,.0f} to repair the {len(reached):,} pumps reached in time, "
+            f"**plus ${triage_risk_cost:,.0f} in assumed full-replacement risk** for the "
+            f"{len(unreached):,} flagged pumps NOT reached within capacity -- this total is not "
+            "just the repair bill, it's the repair bill plus the cost of what's left exposed."
+        )
     with colB:
         st.markdown("**Blanket Replacement Strategy**")
         st.metric("Pumps replaced (all)", len(filtered))
@@ -1345,12 +1356,45 @@ elif selected_page == "Data & Methodology":
 
     st.divider()
     st.subheader("The false-alarm vs. missed-repair tradeoff")
+
+    # Computed live from model_results every time this page runs -- never hand-typed --
+    # so these fractions can't silently go stale if the model, data, or seed ever changes.
+    def _fraction_phrase(rate):
+        """Turns a 0-1 rate into a human 'about N in M' phrase, picking the
+        simplest fraction (smallest denominator) that's closest to the real
+        value -- e.g. 0.667 -> 'about 2 in 3', not 'nearly all'."""
+        if rate <= 0.02:
+            return "essentially none"
+        if rate >= 0.98:
+            return "nearly all"
+        best = None
+        for m in range(2, 21):
+            n = round(rate * m)
+            if n == 0 or n == m:
+                continue
+            err = abs(n / m - rate)
+            if best is None or err < best[0]:
+                best = (err, n, m)
+        _, n, m = best
+        return f"about {n} in {m}"
+
+    tradeoff_rows = []
+    for model_name in ["XGBoost", "Decision Tree (unweighted)", "Decision Tree (balanced)"]:
+        if model_name not in model_results:
+            continue
+        rpt = model_results[model_name]["report"]["functional needs repair"]
+        recall = rpt["recall"]
+        precision = rpt["precision"]
+        false_alarm_rate = 1 - precision  # of flagged pumps, share that did NOT actually need repair
+        tradeoff_rows.append(
+            f"- **{model_name}**: catches {_fraction_phrase(recall)} of pumps that truly need "
+            f"repair (recall = {recall:.0%}), and of the pumps it flags, "
+            f"{_fraction_phrase(false_alarm_rate)} turn out to be false alarms (precision = {precision:.0%})."
+        )
+
+    st.markdown("\n".join(tradeoff_rows))
     st.markdown(
         """
-- **XGBoost**: balanced -- decent at both catching real repairs and avoiding false alarms, but still misses most repairs (catches about 1 in 4).
-- **Decision Tree (unweighted)**: high overall accuracy, but nearly blind to real repairs (catches about 1 in 14) -- it would almost never flag a pump in time.
-- **Decision Tree (balanced)**: catches far more real repairs (about 2 in 3) but at the cost of many false alarms -- crews get sent to pumps that turn out fine about 4 times out of 5.
-
 **This is the actual decision a manager faces**: tolerate more false alarms to catch more real repairs
 early, or tolerate missed repairs to keep trips efficient. There is no universally "correct" choice --
 it depends on whether a missed repair (pump fails completely) or a wasted trip (crew cost, no fix

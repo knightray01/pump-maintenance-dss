@@ -383,6 +383,36 @@ def fetch_live_wpdx(limit=2000):
     return live_df, fetched_at
 
 
+# WPdx's own status wording does not match this project's 3-class training
+# taxonomy word-for-word (confirmed against a live pull: WPdx uses labels like
+# "needs repair", "Functional", "dry season", "not in use"). Only labels with
+# an honest, unambiguous equivalent are mapped below. Anything else is left
+# out of the mapping on purpose -- it falls through to "Other / not
+# comparable" rather than being guessed into the nearest-sounding class, so
+# the historical-vs-current comparison never quietly overstates how much of
+# the live feed it actually covers.
+WPDX_STATUS_MAP = {
+    "functional": "functional",
+    "functional but not in use": "functional",
+    "non functional": "non functional",
+    "not functional": "non functional",
+    "abandoned": "non functional",
+    "decommissioned": "non functional",
+    "needs repair": "functional needs repair",
+    "functional needs repair": "functional needs repair",
+}
+
+
+def map_wpdx_status(raw_status):
+    """Maps one WPdx status_clean value onto this project's 3-class taxonomy,
+    or 'Other / not comparable' if there is no honest equivalent (see
+    WPDX_STATUS_MAP above for why some labels -- e.g. 'dry season', 'not in
+    use' -- are deliberately left unmapped)."""
+    if pd.isna(raw_status):
+        return "Other / not comparable"
+    return WPDX_STATUS_MAP.get(str(raw_status).strip().lower(), "Other / not comparable")
+
+
 @st.cache_data
 def get_data_vintage():
     """Reads just the date_recorded column from the raw training file, so the
@@ -1274,6 +1304,52 @@ Scenario.
                 chart_note("Current status breakdown of live-pulled Tanzania records, most recent first. "
                             "This is raw WPdx data shown for comparison -- it does not feed any "
                             "prediction or ranking on this dashboard.")
+
+                st.markdown("**Does recent data still look like the data this model was trained on?**")
+                st.caption(
+                    "This is the direct check for whether aging (2002-2013) training data can still "
+                    "justify this model's predictions: historical status distribution, side-by-side "
+                    "with the current WPdx distribution, on the same 3-class scale. WPdx's own labels "
+                    "(e.g. 'needs repair', 'dry season', 'not in use') don't match the training set's "
+                    "labels word-for-word -- they are mapped onto the closest honest equivalent, and any "
+                    "label with no real equivalent is excluded rather than guessed, so this comparison "
+                    "never silently overstates its own coverage."
+                )
+                class_order = list(class_names)
+                hist_pct = (
+                    results_df["actual_status"].value_counts(normalize=True) * 100
+                ).reindex(class_order).fillna(0)
+                live_mapped = live_df["status_clean"].apply(map_wpdx_status)
+                live_pct_all = (live_mapped.value_counts(normalize=True) * 100)
+                unmapped_share = live_pct_all.get("Other / not comparable", 0.0)
+                live_pct = live_pct_all.reindex(class_order).fillna(0)
+
+                vintage_compare = pd.DataFrame({
+                    "Historical (2002-2013)": hist_pct,
+                    "Current (WPdx live)": live_pct,
+                }).reset_index().rename(columns={"index": "Status"})
+                vintage_compare_long = vintage_compare.melt(
+                    id_vars="Status", var_name="Source", value_name="Share (%)"
+                )
+                fig_vintage_compare = px.bar(
+                    vintage_compare_long, x="Status", y="Share (%)", color="Source", barmode="group",
+                    color_discrete_map={
+                        "Historical (2002-2013)": "#17324D",
+                        "Current (WPdx live)": "#2A8C82",
+                    },
+                    template=PLOTLY_TEMPLATE,
+                )
+                fig_vintage_compare.update_layout(
+                    height=350, margin=dict(l=10, r=10, t=10, b=10), **PLOTLY_BG
+                )
+                st.plotly_chart(fig_vintage_compare, use_container_width=True)
+                chart_note(
+                    f"Bars close together per status = current conditions still resemble the training "
+                    f"era; a widening gap would flag that the model may need retraining on newer data. "
+                    f"{unmapped_share:.0f}% of this WPdx pull used status wording with no honest "
+                    "equivalent in the 3-class taxonomy (e.g. 'dry season', 'not in use') and is "
+                    "excluded from the percentages above, not forced into a nearest-sounding bucket."
+                )
             if "public_data_source" in live_df.columns:
                 st.caption(
                     f"Contributor diversity: {live_df['public_data_source'].nunique()} distinct sources "

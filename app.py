@@ -102,9 +102,45 @@ FEATURES = [
 CATEGORICAL = ["extraction_type", "quantity", "waterpoint_type", "region"]
 TARGET = "status_group"
 
-# AHP weights -- derived and consistency-checked separately
-# (pairwise comparison: Confidence vs Population vs Age; CR = 0.033, < 0.10 threshold -> consistent)
-AHP_WEIGHTS = {"confidence": 0.6333, "population": 0.2605, "age": 0.1062}
+# ============================================================
+# AHP (Analytic Hierarchy Process) -- derived transparently in code, not
+# hardcoded. The pairwise matrix below is the actual judgment being made:
+# Confidence judged moderately more important than Population (Saaty value
+# 3), strongly more important than Age (5); Population judged moderately
+# more important than Age (3). This is a SUBJECTIVE judgment call -- AHP
+# does not claim to remove that subjectivity, only to make it explicit and
+# internally consistent (see the consistency ratio below, and the
+# sensitivity analysis on Data & Methodology for how the final ranking
+# holds up under alternative, equally defensible judgments).
+AHP_CRITERIA = ["confidence", "population", "age"]
+AHP_PAIRWISE_MATRIX = np.array([
+    [1,    3,    5],    # Confidence vs [Confidence, Population, Age]
+    [1/3,  1,    3],    # Population vs [Confidence, Population, Age]
+    [1/5,  1/3,  1],    # Age        vs [Confidence, Population, Age]
+])
+AHP_RANDOM_INDEX = {1: 0.0, 2: 0.0, 3: 0.58, 4: 0.90, 5: 1.12,
+                    6: 1.24, 7: 1.32, 8: 1.41, 9: 1.45, 10: 1.49}
+
+
+def derive_ahp_weights(matrix):
+    """Derives AHP priority weights from a pairwise comparison matrix using
+    Saaty's normalize-columns-then-average-rows method, plus the standard
+    consistency ratio (CR) check. Returns (weights_dict, consistency_ratio).
+    CR < 0.10 means the judgments don't logically contradict each other --
+    it does NOT mean the judgments are objectively correct or unbiased."""
+    n = matrix.shape[0]
+    normalized = matrix / matrix.sum(axis=0)
+    weights = normalized.mean(axis=1)
+
+    weighted_sum = matrix @ weights
+    lambda_max = (weighted_sum / weights).mean()
+    ci = (lambda_max - n) / (n - 1)
+    ri = AHP_RANDOM_INDEX.get(n, 1.49)
+    cr = ci / ri if ri > 0 else 0.0
+    return dict(zip(AHP_CRITERIA, weights)), cr
+
+
+AHP_WEIGHTS, AHP_CONSISTENCY_RATIO = derive_ahp_weights(AHP_PAIRWISE_MATRIX)
 
 # Default illustrative cost assumptions -- used ONLY on the Cost & Capacity
 # Scenario page, where the assumptions are visible and adjustable. Not
@@ -345,20 +381,27 @@ def train_models(df):
     return df, results, y_encoder.classes_
 
 
-@st.cache_data
-def compute_ahp_priority(df):
-    df = df.copy()
+def _ahp_score_vector(df, weights):
+    """Computes the per-pump AHP priority SCORE (not to be confused with the
+    fixed per-criterion WEIGHTS above) -- this is what differs for every
+    pump and what the Maintenance Worklist actually ranks by."""
     conf_norm = df["needs_repair_confidence"]
     pop_norm = np.log1p(df["population"]) / np.log1p(df["population"]).max()
     age_norm = 1 - (
         (df["construction_year"] - df["construction_year"].min())
         / (df["construction_year"].max() - df["construction_year"].min())
     )
-    df["ahp_priority_score"] = (
-        AHP_WEIGHTS["confidence"] * conf_norm
-        + AHP_WEIGHTS["population"] * pop_norm
-        + AHP_WEIGHTS["age"] * age_norm
+    return (
+        weights["confidence"] * conf_norm
+        + weights["population"] * pop_norm
+        + weights["age"] * age_norm
     )
+
+
+@st.cache_data
+def compute_ahp_priority(df):
+    df = df.copy()
+    df["ahp_priority_score"] = _ahp_score_vector(df, AHP_WEIGHTS)
     return df
 
 
@@ -1115,6 +1158,113 @@ elif selected_page == "Data & Methodology":
 - The model predicts from a single snapshot per pump, not a time series -- there is no "how long
   has this pump been flagged" signal yet
         """
+    )
+
+    st.divider()
+    st.subheader("Priority ranking methodology (AHP)")
+    st.caption(
+        "Two different numbers get used in this dashboard and it's easy to mix them up: a "
+        "**weight** is fixed and describes one criterion's general importance (there are only 3, "
+        "shown below). A **score** is computed per pump and changes for every row -- it's what "
+        "actually ranks the Maintenance Worklist. This section shows exactly how the weights were "
+        "derived, and is transparent about where subjectivity enters the process."
+    )
+
+    st.markdown("**Step 1 -- the pairwise comparison judgment (Saaty 1-9 scale)**")
+    st.caption(
+        "This matrix IS the subjective judgment call: Confidence is judged moderately more "
+        "important than Population (3), and strongly more important than Age (5); Population is "
+        "judged moderately more important than Age (3). AHP does not remove this subjectivity -- "
+        "it only makes it explicit and checks it for internal consistency."
+    )
+    pairwise_display = pd.DataFrame(
+        AHP_PAIRWISE_MATRIX, index=["Confidence", "Population", "Age"],
+        columns=["Confidence", "Population", "Age"],
+    ).round(3)
+    st.dataframe(pairwise_display, use_container_width=True)
+
+    st.markdown("**Step 2 -- derived weights and consistency check**")
+    wcol1, wcol2, wcol3, wcol4 = st.columns(4)
+    wcol1.metric("Weight: Confidence", f"{AHP_WEIGHTS['confidence']:.4f}")
+    wcol2.metric("Weight: Population", f"{AHP_WEIGHTS['population']:.4f}")
+    wcol3.metric("Weight: Age", f"{AHP_WEIGHTS['age']:.4f}")
+    wcol4.metric("Consistency Ratio", f"{AHP_CONSISTENCY_RATIO:.4f}",
+                 help="CR < 0.10 means the pairwise judgments above don't logically contradict "
+                      "each other. It does NOT mean the weights are objectively correct.")
+    st.caption(
+        f"CR = {AHP_CONSISTENCY_RATIO:.4f} is below the standard 0.10 threshold, confirming the "
+        "judgments in Step 1 are internally consistent. **This is a coherence check, not a bias "
+        "check** -- a different, equally internally-consistent set of judgments (e.g. weighting "
+        "Population highest instead of Confidence) is just as mathematically valid. That's exactly "
+        "why the sensitivity analysis below exists."
+    )
+
+    st.divider()
+    st.markdown("**Step 3 -- sensitivity analysis: how much does the ranking depend on these weights?**")
+    st.caption(
+        "Since the weights above encode one subjective judgment, not an objective truth, this "
+        "checks whether the Maintenance Worklist's top-priority pumps are robust to that choice, "
+        "or whether a different reasonable judgment would send crews somewhere completely "
+        "different. We compare the current weighting against two alternative, equally defensible "
+        "scenarios."
+    )
+    sensitivity_scenarios = {
+        "Current (Confidence-dominant)": AHP_WEIGHTS,
+        "Equal weights (no criterion favored)": {"confidence": 1 / 3, "population": 1 / 3, "age": 1 / 3},
+        "Equity-first (Population-dominant)": {
+            "confidence": AHP_WEIGHTS["population"],
+            "population": AHP_WEIGHTS["confidence"],
+            "age": AHP_WEIGHTS["age"],
+        },
+    }
+    needs_repair_pool = filtered[filtered["predicted_status"] == "functional needs repair"].copy()
+    scenario_top_ids = {}
+    for scenario_name, scenario_weights in sensitivity_scenarios.items():
+        scored = needs_repair_pool.copy()
+        scored["_sens_score"] = _ahp_score_vector(scored, scenario_weights)
+        scenario_top_ids[scenario_name] = set(
+            scored.sort_values("_sens_score", ascending=False).head(30)["id"]
+        )
+
+    baseline_name = "Current (Confidence-dominant)"
+    baseline_ids = scenario_top_ids[baseline_name]
+    sens_rows = []
+    for scenario_name, ids in scenario_top_ids.items():
+        overlap = len(ids & baseline_ids)
+        sens_rows.append({
+            "Weighting scenario": scenario_name,
+            "Overlap with current top-30": f"{overlap}/30 ({overlap / 30:.0%})",
+        })
+    st.dataframe(pd.DataFrame(sens_rows), use_container_width=True, hide_index=True)
+
+    equal_overlap = len(scenario_top_ids["Equal weights (no criterion favored)"] & baseline_ids)
+    equity_overlap = len(scenario_top_ids["Equity-first (Population-dominant)"] & baseline_ids)
+    min_overlap_pct = min(equal_overlap, equity_overlap) / 30
+    if min_overlap_pct >= 0.7:
+        st.success(
+            f"The top-30 priority list is **robust**: at least {min_overlap_pct:.0%} of the same "
+            "pumps stay in the top-30 even under meaningfully different weighting philosophies. "
+            "The specific judgment encoded in Step 1 matters less than it might seem -- these pumps "
+            "would likely be flagged as high-priority under several reasonable perspectives."
+        )
+    else:
+        st.warning(
+            f"The top-30 priority list is **sensitive to the weighting choice**: only "
+            f"{min_overlap_pct:.0%} overlap under an alternative scenario. This means which pumps "
+            "get visited first depends meaningfully on whose judgment set the weights -- a real "
+            "limitation worth stating plainly rather than hiding behind a single confident ranking."
+        )
+    widget_purpose(
+        purpose="directly answer the critique that AHP weights encode one person's subjective "
+                "judgment -- by testing whether the resulting priority list actually depends on "
+                "that judgment, instead of just asserting the weights are fine.",
+        shows="the current weighted ranking's top-30 pumps compared against two alternative, "
+              "equally defensible weighting philosophies.",
+        read_as="high overlap = the recommendation is robust despite the subjectivity in the "
+                "weights; low overlap = the ranking is fragile and the weighting choice itself "
+                "needs to be defended, not just assumed.",
+        not_text="a claim that the current weights are correct -- it's a check on how much that "
+                 "would matter if they weren't.",
     )
 
     st.divider()
